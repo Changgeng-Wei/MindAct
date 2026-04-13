@@ -33,6 +33,23 @@ const path = require('path');
 
 const cwd = process.env.PTY_CWD || process.cwd();
 
+// Read a value from the root .env file.
+function readDotEnvValue(key) {
+  try {
+    const envFile = path.join(__dirname, '.env');
+    for (const line of fs.readFileSync(envFile, 'utf-8').split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq === -1) continue;
+      if (trimmed.slice(0, eq).trim() === key) {
+        return trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+      }
+    }
+  } catch {}
+  return undefined;
+}
+
 function ensureSpawnHelperExecutable() {
   try {
     const helper = path.join(
@@ -55,8 +72,15 @@ function ensureSpawnHelperExecutable() {
 ensureSpawnHelperExecutable();
 
 function isExecutable(cmd) {
+  if (!cmd || typeof cmd !== 'string') return false;
   const { execSync } = require('child_process');
+  const looksLikePath =
+    /[\\/]/.test(cmd) ||
+    (process.platform === 'win32' && /\.(exe|cmd|bat)$/i.test(cmd));
   try {
+    if (looksLikePath) {
+      return fs.existsSync(cmd);
+    }
     if (process.platform === 'win32') {
       execSync(`where ${JSON.stringify(cmd)}`, { stdio: 'ignore' });
     } else {
@@ -65,6 +89,17 @@ function isExecutable(cmd) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function whereWin(cmd) {
+  if (process.platform !== 'win32') return '';
+  const { execSync } = require('child_process');
+  try {
+    const out = execSync(`where ${JSON.stringify(cmd)}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return String(out || '').trim();
+  } catch {
+    return '';
   }
 }
 
@@ -104,37 +139,44 @@ function resolveEntryCommand() {
   return null;
 }
 
-// Read kplr key from ~/.config/physmind/credentials (same file claw writes to).
-function readKplrKey() {
+// Read DashScope API key from global credentials file or .env.
+function readDashScopeKey() {
+  // Try global credentials file first (~/.config/physmind/credentials)
   try {
     const credFile = path.join(require('os').homedir(), '.config', 'physmind', 'credentials');
-    if (!fs.existsSync(credFile)) return null;
-    const lines = fs.readFileSync(credFile, 'utf-8').split('\n');
-    for (const line of lines) {
-      const m = line.match(/^KPLR_KEY="?([^"]+)"?/);
-      if (m) return m[1].trim();
+    if (fs.existsSync(credFile)) {
+      for (const line of fs.readFileSync(credFile, 'utf-8').split('\n')) {
+        const m = line.match(/^KPLR_KEY="?([^"]+)"?/);
+        if (m) return m[1].trim();
+      }
     }
   } catch {}
-  return null;
+  // Fall back to .env
+  return process.env.DASHSCOPE_API_KEY || readDotEnvValue('DASHSCOPE_API_KEY') || null;
 }
 
-// Build the environment for claw: strip ANTHROPIC_API_KEY so claw doesn't
-// fall back to Claude, and inject KPLR_KEY + DASHSCOPE_API_KEY from the
-// credentials file so claw works in non-interactive PTY mode.
+// Build the environment for claw: forward all provider config from .env and
+// global credentials to the spawned Rust CLI process.
 function buildClawEnv() {
   const env = { ...process.env };
-  delete env.ANTHROPIC_API_KEY;
-  delete env.ANTHROPIC_AUTH_TOKEN;
-  const kplrKey = readKplrKey() || env.KPLR_KEY;
-  if (kplrKey) {
-    env.KPLR_KEY = kplrKey;
-    env.DASHSCOPE_API_KEY = kplrKey;
-  } else {
-    delete env.DASHSCOPE_API_KEY;
-    delete env.KPLR_KEY;
+  // Forward all provider config keys from env var or .env
+  const keys = [
+    'DASHSCOPE_BASE_URL', 'DASHSCOPE_API_KEY', 'DASHSCOPE_MODEL',
+    'ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL',
+    'OPENAI_BASE_URL',    'OPENAI_API_KEY',    'OPENAI_MODEL',
+    'XAI_BASE_URL',       'XAI_API_KEY',       'XAI_MODEL',
+    'ACTIVE_PROVIDER',
+  ];
+  for (const key of keys) {
+    const val = (process.env[key] && process.env[key].trim()) || readDotEnvValue(key);
+    if (val) {
+      env[key] = val;
+    }
   }
-  // Always inject proxy URL so claw routes to KeploreAI regardless of local shell config
-  env.DASHSCOPE_BASE_URL = 'https://physmind-proxy.marvin-gao-cs.workers.dev/v1';
+  // Backward compat: map KPLR_KEY to DASHSCOPE_API_KEY if needed
+  if (!env.DASHSCOPE_API_KEY && env.KPLR_KEY) {
+    env.DASHSCOPE_API_KEY = env.KPLR_KEY;
+  }
   // Point claw at a MindAct-specific config dir so ~/.claw/credentials.json
   // (which may contain a saved Anthropic OAuth token) is never read.
   env.CLAW_CONFIG_HOME = path.join(require('os').homedir(), '.config', 'physmind', 'claw');
@@ -143,8 +185,16 @@ function buildClawEnv() {
   return env;
 }
 
-function hasKplrKey() {
-  return !!(readKplrKey() || process.env.KPLR_KEY);
+// Check if any provider API key is configured.
+function hasAnyProviderKey() {
+  const envKeys = [
+    'DASHSCOPE_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'XAI_API_KEY',
+  ];
+  for (const key of envKeys) {
+    if (process.env[key] || readDotEnvValue(key)) return true;
+  }
+  // Also check global credentials file
+  return !!readDashScopeKey();
 }
 
 let term = null;
@@ -158,11 +208,11 @@ function send(msg) {
 function spawnTerm(cols, rows) {
   if (term) { try { term.kill(); } catch {} }
 
-  if (!hasKplrKey()) {
+  if (!hasAnyProviderKey()) {
     send({
       type: 'data',
-      data: '\r\n\x1b[31m[PhysMind] No KeploreAI key found.\x1b[0m\r\n' +
-            '\x1b[90mGo to Settings and enter your kplr-... key to get started.\x1b[0m\r\n\r\n',
+      data: '\r\n\x1b[31m[PhysMind] No API Key found.\x1b[0m\r\n' +
+            '\x1b[90mSet at least one API key in the .env file to get started.\x1b[0m\r\n\r\n',
     });
     return;
   }
@@ -173,7 +223,8 @@ function spawnTerm(cols, rows) {
       type: 'data',
       data:
         '\r\n\x1b[31m[MindAct] Claude CLI not found.\x1b[0m\r\n' +
-        '\x1b[90mInstall: npm install -g @anthropic-ai/claude-code\x1b[0m\r\n\r\n',
+        '\x1b[90mBuild/install physmind.exe (recommended): run .\\setup.ps1, or build from source: cd .\\cli\\rust && cargo build --release -p rusty-claude-cli\x1b[0m\r\n' +
+        '\x1b[90mOr set CLAUDE_BIN to an absolute path of the CLI binary.\x1b[0m\r\n\r\n',
     });
     send({ type: 'exit' });
     process.exit(1);
@@ -189,11 +240,15 @@ function spawnTerm(cols, rows) {
       env: buildClawEnv(),
     });
   } catch (err) {
+    const msg = String(err && err.message ? err.message : err);
+    const whereOut = typeof entry.command === 'string' ? whereWin(entry.command) : '';
     send({
       type: 'data',
       data:
         '\r\n\x1b[31m[MindAct] PTY unavailable. Claude terminal cannot start.\x1b[0m\r\n' +
-        `\x1b[90m${String(err && err.message ? err.message : err)}\x1b[0m\r\n\r\n`,
+        `\x1b[90m${msg}\x1b[0m\r\n` +
+        (whereOut ? `\x1b[90mwhere ${entry.command}:\r\n${whereOut}\x1b[0m\r\n` : '') +
+        '\x1b[90mFix: ensure physmind.exe is on PATH (usually %USERPROFILE%\\.cargo\\bin) or set CLAUDE_BIN to the full path.\x1b[0m\r\n\r\n',
     });
     send({ type: 'exit' });
     process.exit(1);
@@ -202,8 +257,8 @@ function spawnTerm(cols, rows) {
   term.onData((data) => {
     // Replace internal credential error messages with user-friendly text.
     const filtered = data
-      .replace(/missing DashScope credentials[^\r\n]*/g, 'No KeploreAI key found. Go to Settings and enter your kplr-... key.')
-      .replace(/missing Anthropic credentials[^\r\n]*/g, 'No KeploreAI key found. Go to Settings and enter your kplr-... key.')
+      .replace(/missing DashScope credentials[^\r\n]*/g, 'No API Key found. Set DASHSCOPE_API_KEY in the .env file.')
+      .replace(/missing Anthropic credentials[^\r\n]*/g, 'No API Key found. Set ANTHROPIC_API_KEY in the .env file.')
       .replace(/export ANTHROPIC_AUTH_TOKEN[^\r\n]*/g, '')
       .replace(/export ANTHROPIC_API_KEY[^\r\n]*/g, '')
       .replace(/ANTHROPIC_AUTH_TOKEN[^\r\n]*/g, '')

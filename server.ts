@@ -170,6 +170,25 @@ function writeConfig(config: Config) {
   writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
+// Read a value from the root .env file.
+function readDotEnvValue(key: string): string | undefined {
+  try {
+    const envFile = join(import.meta.dir, ".env");
+    for (const line of readFileSync(envFile, "utf-8").split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eq = trimmed.indexOf("=");
+      if (eq === -1) continue;
+      if (trimmed.slice(0, eq).trim() === key) {
+        const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+        return val || undefined;
+      }
+    }
+  } catch {}
+  return undefined;
+}
+
+// Save key to the global credentials file (~/.config/physmind/credentials).
 function saveKplrCredentials(key: string) {
   const credDir = join(homedir(), ".config", "physmind");
   const credFile = join(credDir, "credentials");
@@ -177,17 +196,20 @@ function saveKplrCredentials(key: string) {
   writeFileSync(credFile, `KPLR_KEY="${key}"\n`);
 }
 
+// Read key from the global credentials file, with .env as fallback.
 function readKplrCredentials(): string | null {
+  // Try global credentials file first
   const credFile = join(homedir(), ".config", "physmind", "credentials");
-  if (!existsSync(credFile)) return null;
-  try {
-    const lines = readFileSync(credFile, "utf-8").split("\n");
-    for (const line of lines) {
-      const m = line.match(/^KPLR_KEY="?([^"]+)"?/);
-      if (m) return m[1].trim();
-    }
-  } catch {}
-  return null;
+  if (existsSync(credFile)) {
+    try {
+      for (const line of readFileSync(credFile, "utf-8").split("\n")) {
+        const m = line.match(/^KPLR_KEY="?([^"]+)"?/);
+        if (m) return m[1].trim();
+      }
+    } catch {}
+  }
+  // Fall back to .env
+  return readDotEnvValue("DASHSCOPE_API_KEY") ?? null;
 }
 
 interface TreeNode {

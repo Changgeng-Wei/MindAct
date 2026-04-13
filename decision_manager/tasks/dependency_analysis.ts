@@ -429,7 +429,7 @@ ${hints}
 
   } catch (err: any) {
     const rawMsg: string = err?.message ?? String(err);
-    const msg = rawMsg.includes("ANTHROPIC_API_KEY")
+    const msg = rawMsg.includes("API Key") || rawMsg.includes("API_KEY")
       ? m("error_no_api_key")
       : m("error_analysis", { msg: rawMsg });
     log(`❌ ${msg}`);

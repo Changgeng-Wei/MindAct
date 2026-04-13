@@ -44,14 +44,34 @@ if ([int]$nodeVer -lt 18) {
 }
 ok "Node.js $(node --version)"
 
-# -- 3. Download physmind.exe from GitHub Actions -----------------
+# -- 3. Rust/Cargo ------------------------------------------------
 Write-Host ""
-Write-Host "Downloading physmind.exe (pre-built by GitHub CI)..."
-
+Write-Host "Checking Rust/Cargo..."
 $cargoBin = "$env:USERPROFILE\.cargo\bin"
 if (-not (Test-Path $cargoBin)) {
     New-Item -ItemType Directory -Path $cargoBin -Force | Out-Null
 }
+$env:PATH = "$cargoBin;$env:PATH"
+
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    warn "Rust/Cargo not found -- installing via rustup..."
+    $rustupUrl = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe"
+    $rustupExe = Join-Path $env:TEMP "rustup-init.exe"
+    Invoke-WebRequest -Uri $rustupUrl -OutFile $rustupExe -UseBasicParsing
+    & $rustupExe -y | Out-Null
+    $env:PATH = "$cargoBin;$env:PATH"
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        die "Rust install failed. Install manually: https://www.rust-lang.org/tools/install"
+    }
+    ok "Rust installed"
+} else {
+    ok "Cargo $(cargo --version)"
+}
+
+# -- 4. Get/build physmind.exe ------------------------------------
+Write-Host ""
+Write-Host "Downloading physmind.exe (pre-built by GitHub CI)..."
+
 $dest = "$cargoBin\physmind.exe"
 
 # Get the latest successful workflow run artifact download URL
@@ -89,32 +109,48 @@ try {
     Invoke-WebRequest -Uri $releaseUrl -OutFile $dest -UseBasicParsing
     ok "physmind.exe downloaded to $dest"
 } catch {
-    warn "No release binary found yet."
-    Write-Host ""
-    Write-Host "  The physmind.exe is built automatically by GitHub Actions on every push."
-    Write-Host "  To get it:"
-    Write-Host "  1. Go to: https://github.com/$REPO/actions/workflows/build-cli.yml"
-    Write-Host "  2. Click the latest successful run"
-    Write-Host "  3. Download the 'physmind-windows-x64' artifact"
-    Write-Host "  4. Extract physmind.exe to: $cargoBin"
-    Write-Host "  5. Re-run this script"
-    Write-Host ""
-    $skip = Read-Host "Press Enter to continue setup without CLI (you can add it later), or Ctrl+C to abort"
+    warn "No release binary found. Building physmind.exe from source..."
+    $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $cliDir = Join-Path $root "cli\rust"
+    if (-not (Test-Path $cliDir)) {
+        die "cli\rust not found. Did you clone with --recurse-submodules?"
+    }
+    try {
+        Push-Location $cliDir
+        cargo build --release -p rusty-claude-cli
+        Pop-Location
+        $built = Join-Path $cliDir "target\release\physmind.exe"
+        if (-not (Test-Path $built)) {
+            die "Build finished but $built not found."
+        }
+        Copy-Item -Force $built $dest
+        ok "physmind.exe built and copied to $dest"
+    } catch {
+        warn "Failed to build physmind.exe. Ensure Visual Studio C++ Build Tools is installed."
+        Write-Host ""
+        Write-Host "  You can still continue without the embedded terminal, but terminal will not work until physmind.exe is available."
+        Write-Host "  Manual build:"
+        Write-Host "    cd .\cli\rust"
+        Write-Host "    cargo build --release -p rusty-claude-cli"
+        Write-Host "    copy .\target\release\physmind.exe $cargoBin\physmind.exe"
+        Write-Host ""
+        $skip = Read-Host "Press Enter to continue setup without CLI, or Ctrl+C to abort"
+    }
 }
 
-# -- 4. Git submodule ---------------------------------------------
+# -- 5. Git submodule ---------------------------------------------
 Write-Host ""
 Write-Host "Initialising submodule..."
 git submodule update --init --recursive
 ok "Submodule ready"
 
-# -- 5. Root dependencies -----------------------------------------
+# -- 6. Root dependencies -----------------------------------------
 Write-Host ""
 Write-Host "Installing root dependencies..."
 bun install
 ok "Root dependencies installed"
 
-# -- 6. Build client ----------------------------------------------
+# -- 7. Build client ----------------------------------------------
 Write-Host ""
 Write-Host "Building client..."
 Push-Location client
